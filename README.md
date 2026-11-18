@@ -11,6 +11,7 @@
 - 缺块可补传；摘要不符 **拒绝发布** 并提示重新创建任务
 - 多进程并发上传/提交、磁盘写失败、进程重启均不会发布残缺文件或产生两份成品
 - 已发布的包重启后仍可下载
+- **成品下载限速**：网页设置全服务每秒字节预算与突发额度，所有服务进程的并发下载共用同一预算；下载中修改即时生效，设置重启后保留；下载仍是完整原包的流式传输
 
 ## 快速开始
 
@@ -41,9 +42,21 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 | GET | `/api/tasks/{id}` | 任务详情：`received_chunks` / `missing_chunks` / `state` |
 | PUT | `/api/tasks/{id}/chunks/{i}` | 上传第 i 块（1 MiB，最后一块按实际大小）。同内容重传返回 `deduplicated:true`；异内容 409 |
 | POST | `/api/tasks/{id}/finalize` | 核对分块+大小+摘要，通过则发布；缺块返回 409+`missing_chunks`；摘要不符标记 `failed` |
-| GET | `/api/tasks/{id}/download` | 下载已发布的包（未发布返回 409） |
+| GET | `/api/tasks/{id}/download` | 下载已发布的包（未发布返回 409）；受全服务限速约束，支持单段 `Range` 与 `HEAD` |
+| GET | `/api/settings` | 读取下载限速 `{rate_bps, burst_bytes, unlimited}` |
+| PUT | `/api/settings` | 设置下载限速 `{rate_bps, burst_bytes}`；`rate_bps=0` 表示不限速 |
 
 任务状态机：`uploading` → `published`（终态）/ `failed`（终态，摘要不符）。
+
+## 下载限速
+
+- **全服务一个预算**：令牌桶存放在共享 SQLite 的 `download_rate` 表中，容器内两个 uvicorn 进程（以及任意数量的并发下载）都从这一个桶取字节，不存在“每进程一份”的放大。
+- **流式完整原包**：下载仍按 64 KiB 分块顺序吐出成品文件，`Content-Length`、`Content-Disposition` 与整包字节不变；每个连接有自己的文件偏移，多个客户端同时下载同一包时各自收到的字节连续且准确。
+- **等待而非报错**：配额不足时发送方按需睡眠，随后继续发送。限速只表现为变慢，不会产生 4xx/5xx 或“文件损坏”。
+- **下载中改设置即时生效**：每个分块发送前都读取当前设置，修改后从下一小段起按新预算发送；无需重连或重启。
+- **重启保留**：设置写入 `synchronous=FULL` 的 SQLite 连接，服务重启后仍生效。
+- **慢客户端不占坑**：响应独立监听 `http.disconnect`，客户端断开即取消该路发送并释放文件句柄；已在途的最多一个 64 KiB 分块预算不会继续被消耗，也不会拖住其他下载。
+- `rate_bps=0` 为不限速（默认），此时限速路径不做任何写操作，下载速度与旧版一致。
 
 ## 一致性设计
 
@@ -60,12 +73,15 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 ```
 
 - `tests/test_app.py`（14 项）：完整流程、续传、幂等去重、异内容拒绝、缺块补传、摘要拒绝、磁盘失败注入（chunk 上传 / finalize 两条路径）、重启恢复、空文件、参数校验。
+- `tests/test_common.py`（9 项）：令牌桶纯逻辑（假时钟）：默认不限速、突发用尽后等待再补充、不超发、跨实例共享一个桶、设置即时生效与非法值拒绝、重启后设置保留、取消下载后返还未发送的额度。
+- `tests/test_download.py`（13 项）：限速下载仍字节准确、串行与并发下载共享预算、下载中改设置即时生效、断开客户端释放预算、`Range`/`HEAD`、未发布仍 409/404、限速期间上传发布不受影响。
 - `tests/test_live.py`（3 项）：两个 uvicorn 进程并发上传/并发提交同一任务、kill -9 后重启续传、已发布包重启后可下载、跨进程同块并发去重。
+- `tests/test_live_download.py`（4 项）：两个真实 uvicorn 进程共享一个预算、在一进程上改设置影响另一进程的在途下载、全部重启后预算仍生效、真实断连后预算不被僵尸连接占用。
 
 ## 数据布局（`DATA_DIR`）
 
 ```
-uploader.db        SQLite（WAL）
+uploader.db        SQLite（WAL）：任务、分块与全服务下载限速设置/令牌桶
 chunks/<task>/     已收分块
 published/<task>   校验通过后的成品（原子改名出现）
 tmp/               临时文件（启动时清理超过 1 小时的残留）

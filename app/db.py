@@ -8,6 +8,9 @@ mutation is a single statement, hence atomic.
 from __future__ import annotations
 
 import sqlite3
+import time
+
+from .ratelimit import RATE_LIMIT_SCHEMA, set_wal_with_retry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -32,15 +35,21 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 """
 
+SCHEMA = SCHEMA + RATE_LIMIT_SCHEMA
+
 
 def connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(
         str(db_path), timeout=30.0, isolation_level=None, check_same_thread=False
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
+    # Switching journal_mode needs a brief exclusive lock.  Several workers
+    # may start at the same instant (e.g. "docker compose up" with
+    # --workers 2), so retry instead of failing startup.  busy_timeout is set
+    # first so these PRAGMAs themselves wait for a concurrent starter.
     conn.execute("PRAGMA busy_timeout=30000")
+    set_wal_with_retry(conn)
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -48,6 +57,16 @@ def connect(db_path) -> sqlite3.Connection:
 def init_db(db_path) -> None:
     conn = connect(db_path)
     try:
-        conn.executescript(SCHEMA)
+        for attempt in range(50):
+            try:
+                conn.executescript(SCHEMA)
+                return
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if attempt == 49:
+                    raise
+                time.sleep(0.1)
     finally:
         conn.close()

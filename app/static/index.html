@@ -33,6 +33,10 @@
   .msg.err { color: #c62828; } .msg.ok { color: #2e7d32; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
   a.dl { font-weight: 600; }
+  select { padding: 6px 8px; border-radius: 6px; border: 1px solid #8888;
+           background: transparent; font-size: .95rem; }
+  .fmt { display: inline-block; vertical-align: middle; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; }
 </style>
 </head>
 <body>
@@ -59,6 +63,38 @@
     <button id="mCreate">创建空任务</button>
     <span id="mMsg" class="msg"></span>
   </div>
+</section>
+
+<section>
+  <h2>下载限速（全服务共享）</h2>
+  <p class="muted">所有服务进程、所有并发下载共同遵守这一预算。下载过程中修改，从下一小段数据起生效；设置保存在数据目录中，重启后保留。
+  配额用尽时下载会等待而不中断，低速时下载变慢但内容仍完整。速率填 0 表示不限速。</p>
+  <div class="row">
+    <label class="inline">每秒字节
+      <input type="number" id="rateInput" min="0" step="1" style="width:16em" placeholder="例如 1048576">
+    </label>
+    <select id="rateUnit">
+      <option value="1">B/s</option>
+      <option value="1024">KiB/s</option>
+      <option value="1048576" selected>MiB/s</option>
+    </select>
+  </div>
+  <div class="row">
+    <label class="inline">突发额度
+      <input type="number" id="burstInput" min="1" step="1" style="width:16em" placeholder="例如 4">
+    </label>
+    <select id="burstUnit">
+      <option value="1">B</option>
+      <option value="1024">KiB</option>
+      <option value="1048576" selected>MiB</option>
+    </select>
+  </div>
+  <div class="row">
+    <button id="saveSettings">保存限速设置</button>
+    <button id="saveUnlimited">取消限速</button>
+    <span id="settingsMsg" class="msg"></span>
+  </div>
+  <div id="settingsNow" class="muted mono"></div>
 </section>
 
 <section>
@@ -245,6 +281,81 @@ async function refreshTasks() {
 }
 
 $("refreshBtn").onclick = refreshTasks;
+
+// --------------------------------------------------------------- 限速设置
+const fmtBps = n => n <= 0 ? "不限速" : `${n} B/s (${fmtSize(n)}/s)`;
+const fmtBurst = n => `${n} 字节 (${fmtSize(n)})`;
+
+function fillSettingsForm(s) {
+  // 选一个能整除的单位，避免出现小数。
+  const pickUnit = (value, units, fallback) => {
+    for (const u of units) if (value % u === 0) return u;
+    return fallback;
+  };
+  const rateUnits = [1048576, 1024, 1], burstUnits = [1048576, 1024, 1];
+  const ru = pickUnit(s.rate_bps || 0, rateUnits, 1);
+  $("rateUnit").value = String(ru);
+  $("rateInput").value = String(Math.round((s.rate_bps || 0) / ru));
+  const bu = pickUnit(s.burst_bytes || 1, burstUnits, 1);
+  $("burstUnit").value = String(bu);
+  $("burstInput").value = String(Math.round((s.burst_bytes || 1) / bu));
+}
+
+function showSettingsNow(s) {
+  $("settingsNow").textContent =
+    `当前生效：速率 ${fmtBps(s.rate_bps)} · 突发额度 ${fmtBurst(s.burst_bytes)}`;
+}
+
+async function loadSettings() {
+  try {
+    const s = await api("GET", "/api/settings");
+    fillSettingsForm(s);
+    showSettingsNow(s);
+  } catch (e) {
+    $("settingsMsg").className = "msg err";
+    $("settingsMsg").textContent = "读取限速设置失败: " + e.message;
+  }
+}
+
+async function applySettings(rate_bps, burst_bytes) {
+  const msg = $("settingsMsg");
+  msg.className = "msg"; msg.textContent = "保存中…";
+  try {
+    const s = await api("PUT", "/api/settings",
+      { rate_bps: Math.round(rate_bps), burst_bytes: Math.round(burst_bytes) });
+    fillSettingsForm(s);
+    showSettingsNow(s);
+    msg.className = "msg ok";
+    msg.textContent = "已保存，正在进行的下载会按新预算继续。";
+  } catch (e) {
+    msg.className = "msg err";
+    msg.textContent = "保存失败: " + e.message;
+  }
+}
+
+$("saveSettings").onclick = () => {
+  const rate = Number($("rateInput").value) * Number($("rateUnit").value);
+  const burst = Number($("burstInput").value) * Number($("burstUnit").value);
+  if (!Number.isFinite(rate) || rate < 0) {
+    $("settingsMsg").className = "msg err";
+    $("settingsMsg").textContent = "每秒字节必须是不小于 0 的数字。";
+    return;
+  }
+  if (!Number.isFinite(burst) || burst < 1) {
+    $("settingsMsg").className = "msg err";
+    $("settingsMsg").textContent = "突发额度必须是不小于 1 的字节数。";
+    return;
+  }
+  applySettings(rate, burst);
+};
+
+$("saveUnlimited").onclick = () => {
+  // 取消限速：速率 0，突发额度保留表单值（不生效）。
+  const burst = Number($("burstInput").value) * Number($("burstUnit").value);
+  applySettings(0, Number.isFinite(burst) && burst >= 1 ? burst : 1048576);
+};
+
+loadSettings();
 refreshTasks();
 </script>
 </body>

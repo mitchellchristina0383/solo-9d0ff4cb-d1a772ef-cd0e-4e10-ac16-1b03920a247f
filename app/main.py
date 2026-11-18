@@ -5,6 +5,17 @@ Flow:
   2. PUT  /api/tasks/{id}/chunks/{i}   upload 1 MiB chunks (idempotent)
   3. POST /api/tasks/{id}/finalize     verify chunks+size+sha256, then publish
   4. GET  /api/tasks/{id}/download     download the published package
+     GET  /api/settings                read the service-wide download budget
+     PUT  /api/settings                change it (takes effect on live downloads)
+
+Download throttling:
+  all worker processes of the service share one token bucket stored in the
+  same SQLite database (see app/ratelimit.py).  Each streamed 64 KiB chunk
+  must first obtain its bytes from the bucket; when the budget is exhausted
+  the sender waits instead of failing, so a throttled transfer is slow but
+  byte-exact and never looks like a corrupt file.  Because the budget is
+  checked for every chunk, changing the settings applies to downloads that
+  are already running, and settings survive restarts.
 
 Safety properties:
   * a chunk recorded in the DB and present on disk is immutable: re-uploading
@@ -25,15 +36,18 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import storage as storage_mod
 from .db import connect, init_db
+from .download import RateLimitedFileResponse
+from .ratelimit import DownloadRateLimiter
 from .storage import Storage
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
@@ -52,6 +66,11 @@ class CreateTask(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size: int = Field(ge=0)
     sha256: str
+
+
+class RateSettingsBody(BaseModel):
+    rate_bps: int = Field(ge=0)
+    burst_bytes: int = Field(ge=1)
 
 
 def _now_iso() -> str:
@@ -75,8 +94,18 @@ def create_app(data_dir=None) -> FastAPI:
     storage.ensure_dirs()
     init_db(storage.db_path)
     storage.cleanup_stale_tmp()
+    limiter = DownloadRateLimiter(storage.db_path)
 
-    app = FastAPI(title="Incident Package Uploader")
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            limiter.close()
+
+    app = FastAPI(title="Incident Package Uploader", lifespan=lifespan)
+    app.state.storage = storage
+    app.state.rate_limiter = limiter
 
     # ------------------------------------------------------------- helpers
     def get_task_or_404(conn, task_id: str):
@@ -385,8 +414,24 @@ def create_app(data_dir=None) -> FastAPI:
         finally:
             lock_file.close()
 
-    @app.get("/api/tasks/{task_id}/download")
-    def download(task_id: str):
+    @app.get("/api/settings")
+    def get_settings():
+        return limiter.get_settings().as_dict()
+
+    @app.put("/api/settings")
+    def put_settings(body: RateSettingsBody):
+        try:
+            settings = limiter.set_settings(
+                int(body.rate_bps), int(body.burst_bytes)
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return settings.as_dict()
+
+    @app.api_route(
+        "/api/tasks/{task_id}/download", methods=["GET", "HEAD"]
+    )
+    def download(task_id: str, request: Request):
         conn = connect(storage.db_path)
         try:
             task = get_task_or_404(conn, task_id)
@@ -397,10 +442,11 @@ def create_app(data_dir=None) -> FastAPI:
         path = storage.published_path(task_id)
         if not path.exists():
             raise HTTPException(500, "published file missing on disk")
-        return FileResponse(
-            str(path),
+        return RateLimitedFileResponse(
+            path,
             filename=task["filename"],
-            media_type="application/octet-stream",
+            limiter=limiter,
+            request=request,
         )
 
     @app.get("/", response_class=HTMLResponse)
